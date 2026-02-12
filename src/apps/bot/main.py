@@ -7,18 +7,17 @@ from aiogram import Bot, Dispatcher, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 
-from vira.settings import settings
-from infra.logging.logger import setup_logging
 from infra.db.database import get_sessionmaker
-from vira.db.repos.user_repo import UserRepo
+from infra.logging.logger import setup_logging
+from vira.ai.engine import AIEngine
 from vira.db.repos.onboarding_repo import OnboardingRepo
 from vira.db.repos.profile_repo import ProfileRepo
-from vira.ai.engine import AIEngine
+from vira.db.repos.user_repo import UserRepo
+from vira.settings import settings
 
 
 setup_logging()
 log = structlog.get_logger()
-
 router = Router()
 
 
@@ -29,9 +28,6 @@ def kb(*rows: list[str]) -> ReplyKeyboardMarkup:
         one_time_keyboard=True,
     )
 
-
-
-@router.message(Command("restart"))
 
 @router.message(Command("plan"))
 async def plan_handler(message: Message):
@@ -58,11 +54,11 @@ async def plan_handler(message: Message):
     ideas = out["weekly_plan"]["ideas"]
     followups = out.get("followup_questions", [])
 
-    lines = []
+    lines: list[str] = []
     lines.append("✅ پلن اولیه Vira آماده شد")
     lines.append("")
-    lines.append(f"**استراتژی:** {st['summary']}")
-    lines.append(f"**لحن:** {st['tone']} | **فرمت:** {st['format']} | **ریتم:** {st['cadence']}")
+    lines.append(f"استراتژی: {st['summary']}")
+    lines.append(f"لحن: {st['tone']} | فرمت: {st['format']} | ریتم: {st['cadence']}")
     lines.append("")
     lines.append("🔥 ایده‌های این هفته:")
     for i, it in enumerate(ideas, 1):
@@ -70,17 +66,43 @@ async def plan_handler(message: Message):
     lines.append("")
     lines.append("🧪 نمونه اسکریپت:")
     lines.append(out["sample_script"]["script"])
+
     if followups:
         lines.append("")
-        lines.append("برای دقیق‌تر شدن، جواب بده:")
+        lines.append("برای دقیق‌تر شدن، جواب بده (با /refine):")
         for q in followups[:3]:
             lines.append(f"• {q}")
 
     await message.answer("\n".join(lines))
+
+
+@router.message(Command("refine"))
+async def refine_handler(message: Message):
+    tg_id = str(message.from_user.id) if message.from_user else ""
+    if not tg_id:
+        return
+
+    async_session = get_sessionmaker()
+    async with async_session() as session:
+        user_repo = UserRepo(session)
+        u = await user_repo.get_or_create(tg_id)
+
+        onboarding_repo = OnboardingRepo(session)
+        await onboarding_repo.set_state(u.id, "REFINE_CONTENT_TYPE")
+
+    await message.answer(
+        "می‌خوای محتوات بیشتر کدوم سبک باشه؟",
+        reply_markup=kb(["تحلیلی", "خبری/واکنشی"], ["آموزشی/راهنمایی"]),
+    )
+
+
+@router.message(Command("restart"))
 async def restart_handler(message: Message):
     tg_id = str(message.from_user.id) if message.from_user else ""
-    async_session = get_sessionmaker()
+    if not tg_id:
+        return
 
+    async_session = get_sessionmaker()
     async with async_session() as session:
         user_repo = UserRepo(session)
         u = await user_repo.get_or_create(tg_id)
@@ -92,14 +114,16 @@ async def restart_handler(message: Message):
         await profile_repo.delete(u.id)
 
     await message.answer("ریست شد ✅ حالا از اول شروع می‌کنیم.", reply_markup=ReplyKeyboardRemove())
-    # trigger start flow
     await start_handler(message)
+
 
 @router.message(CommandStart())
 async def start_handler(message: Message):
     tg_id = str(message.from_user.id) if message.from_user else ""
-    async_session = get_sessionmaker()
+    if not tg_id:
+        return
 
+    async_session = get_sessionmaker()
     async with async_session() as session:
         user_repo = UserRepo(session)
         u = await user_repo.get_or_create(tg_id)
@@ -115,31 +139,17 @@ async def start_handler(message: Message):
         return
 
     if ob.state == "Q1_LANGUAGE":
-        await message.answer("بریم شروع کنیم 👇\nزبان محتوایی که می‌خوای تولید کنی چیه؟",
-            reply_markup=kb(["فارسی", "انگلیسی"])
+        await message.answer(
+            "بریم شروع کنیم 👇\nزبان محتوایی که می‌خوای تولید کنی چیه؟",
+            reply_markup=kb(["فارسی", "انگلیسی"]),
         )
         return
 
-    await message.answer("ادامه‌ی آنبوردینگ رو بگو /start بزن تا از همونجا ادامه بدیم.")
+    await message.answer("برای ادامه همون مسیر قبلی، جواب سؤال قبلی رو بده یا /restart بزن.")
 
-
-async def main():
-    log.info("bot_starting")
-
-    if not settings.telegram_bot_token:
-        raise SystemExit("TELEGRAM_BOT_TOKEN is empty. Put it in .env")
-    bot = Bot(token=settings.telegram_bot_token)
-    dp = Dispatcher()
-    dp.include_router(router)
-    log.info("bot_polling_started")
-    await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
 
 @router.message()
-async def onboarding_answers(message: Message):
+async def flow_handler(message: Message):
     tg_id = str(message.from_user.id) if message.from_user else ""
     text = (message.text or "").strip()
     if not tg_id or not text:
@@ -148,19 +158,44 @@ async def onboarding_answers(message: Message):
     async_session = get_sessionmaker()
     async with async_session() as session:
         user_repo = UserRepo(session)
-        u = await user_repo.get_or_create(tg_id)
-
         onboarding_repo = OnboardingRepo(session)
-        ob = await onboarding_repo.get_or_create(u.id)
-
         profile_repo = ProfileRepo(session)
+
+        u = await user_repo.get_or_create(tg_id)
+        ob = await onboarding_repo.get_or_create(u.id)
         prof = await profile_repo.get(u.id)
 
-        # if completed, ignore
+        # If completed profile, only refine flow can touch
         if prof and prof.completed_at:
-            await message.answer("پروفایل تو قبلاً کامل شده ✅")
+            # allow refine states even if profile completed
+            if ob.state not in {"REFINE_CONTENT_TYPE", "REFINE_TONE"}:
+                return
+
+        # ---------- REFINE FLOW ----------
+        if ob.state == "REFINE_CONTENT_TYPE":
+            p = await profile_repo.get(u.id)
+            data = dict(p.data or {}) if p else {}
+            data["content_type"] = text
+            await profile_repo.upsert(u.id, data)
+            await onboarding_repo.set_state(u.id, "REFINE_TONE")
+
+            await message.answer(
+                "لحن رو چی ترجیح می‌دی؟",
+                reply_markup=kb(["خودمونی", "رسمی"]),
+            )
             return
 
+        if ob.state == "REFINE_TONE":
+            p = await profile_repo.get(u.id)
+            data = dict(p.data or {}) if p else {}
+            data["tone_pref"] = text
+            await profile_repo.upsert(u.id, data)
+            await onboarding_repo.set_state(u.id, "DONE")
+
+            await message.answer("✅ انجام شد. حالا دوباره /plan رو بزن.", reply_markup=ReplyKeyboardRemove())
+            return
+
+        # ---------- ONBOARDING FLOW ----------
         data = dict(ob.data or {})
 
         if ob.state == "Q1_LANGUAGE":
@@ -172,7 +207,7 @@ async def onboarding_answers(message: Message):
             await onboarding_repo.set_state(u.id, "Q2_NICHE")
             await message.answer(
                 "حوزه‌ی اصلی محتوات چیه؟",
-                reply_markup=kb(["AI/تکنولوژی", "مالی/کریپتو", "آموزشی", "سرگرمی", "لایف‌استایل"], ["سایر"])
+                reply_markup=kb(["AI/تکنولوژی", "مالی/کریپتو", "آموزشی", "سرگرمی", "لایف‌استایل"], ["سایر"]),
             )
             return
 
@@ -182,7 +217,7 @@ async def onboarding_answers(message: Message):
             await onboarding_repo.set_state(u.id, "Q3_GOAL")
             await message.answer(
                 "هدف اصلی تو چیه؟",
-                reply_markup=kb(["درآمد دلاری", "رشد مخاطب فارسی", "برند شخصی", "فروش محصول/سرویس"])
+                reply_markup=kb(["درآمد دلاری", "رشد مخاطب فارسی", "برند شخصی", "فروش محصول/سرویس"]),
             )
             return
 
@@ -190,15 +225,32 @@ async def onboarding_answers(message: Message):
             data["goal"] = text
             await onboarding_repo.set_data(u.id, data)
 
-            # profile upsert + mark completed
             await profile_repo.upsert(u.id, data)
             await profile_repo.mark_completed(u.id)
             await onboarding_repo.set_state(u.id, "DONE")
 
             await message.answer(
-                "عالی ✅ پروفایلت کامل شد.\nحالا می‌تونم برات پلن محتوا و ایده‌ها رو بسازم.",
-                reply_markup=ReplyKeyboardRemove()
+                "عالی ✅ پروفایلت کامل شد.\nحالا می‌تونم برات پلن محتوا و ایده‌ها رو بسازم. دستور: /plan",
+                reply_markup=ReplyKeyboardRemove(),
             )
             return
 
-        await message.answer("برای شروع دوباره: /start")
+        await message.answer("برای شروع: /start")
+
+
+async def main():
+    log.info("bot_starting")
+
+    if not settings.telegram_bot_token:
+        raise SystemExit("TELEGRAM_BOT_TOKEN is empty. Put it in .env")
+
+    bot = Bot(token=settings.telegram_bot_token)
+    dp = Dispatcher()
+    dp.include_router(router)
+
+    log.info("bot_polling_started")
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
